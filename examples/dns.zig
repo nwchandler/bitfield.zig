@@ -72,17 +72,14 @@ const rcode = enum(u4) {
 };
 
 pub fn main() !void {
-    const request: DnsHeader = .{
-        .data = .{
-            .id = 1234,
-            .qr = .query,
-            .opcode = .query,
-            .aa = false,
-            .rcode = .no_error,
-        },
-    };
+    const request = try DnsHeader.fromData(.{
+        .id = 1234,
+        .qr = .query,
+        .opcode = .query,
+        .aa = false,
+        .rcode = .no_error,
+    });
     const encoded_request = try request.encode();
-    // std.debug.print("encoded: 0x{X:024}\n", .{encoded_request});
     std.debug.assert(encoded_request == 0x04D2_0000_0000_0000_0000_0000);
 
     //                                      id               flags            qdcount          ancount          nscount          arcount

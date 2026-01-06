@@ -16,6 +16,10 @@
 //! ```
 
 const std = @import("std");
+const validator = @import("validator.zig");
+
+pub const Validator = validator.Validator;
+pub const validators = validator.validators;
 
 /// Schema defines the overall shape of a bitfield. Callers can define the order
 /// and type of various fields that should be represented within the bitfield.
@@ -36,9 +40,22 @@ pub const Schema = struct {
     /// helper associated functions are available for a nicer development
     /// experience.
     pub const Field = struct {
+        /// The name of the field. This is how the field will be labeled within
+        /// the resulting packed struct.
         name: [:0]const u8,
+
+        /// The data type of the field.
         type: type,
+
+        /// An optional default value for the field in instances of the bitfield.
+        /// This is primarily useful when creating instances using `fromData`,
+        /// in which case users will not be required to enter a value for the
+        /// field. It will have no bearing on instances created using `decode`,
+        /// however, since the actual value will be extracted from input.
         default: ?*const anyopaque = null,
+
+        /// An optional validation rule for the field.
+        validator: ?Validator = null,
 
         /// Create a boolean field. Useful for on-off flags. Customization is
         /// available via `BoolOptions`.
@@ -47,6 +64,7 @@ pub const Schema = struct {
                 .name = name,
                 .type = bool,
                 .default = if (opts.default) |default| &default else null,
+                .validator = opts.validator,
             };
         }
 
@@ -59,6 +77,9 @@ pub const Schema = struct {
             /// for the field. However, it has no impact when either encoding
             /// or decoding bitfields.
             default: ?bool = null,
+
+            /// An optional validation rule for the field.
+            validator: ?Validator = null,
         };
 
         /// Produce an enumerated field. Useful for sets of related bits, such
@@ -77,6 +98,7 @@ pub const Schema = struct {
                 .name = name,
                 .type = opts.type,
                 .default = null,
+                .validator = opts.validator,
             };
         }
 
@@ -98,6 +120,9 @@ pub const Schema = struct {
             /// then you will naturally handle this case with an `else` clause
             /// in the switch.
             type: type,
+
+            /// An optional validation rule for the field.
+            validator: ?Validator = null,
         };
 
         /// Padding inserts padding bits into the bitfield. This only supports
@@ -111,10 +136,19 @@ pub const Schema = struct {
                 },
             });
 
+            const val = if (opts.exact) validators.Exact.init(
+                T,
+                @as(T, opts.value),
+                .{
+                    .err = opts.err,
+                },
+            ) else null;
+
             return .{
                 .name = name,
                 .type = T,
                 .default = &@as(T, opts.value),
+                .validator = val,
             };
         }
 
@@ -131,6 +165,19 @@ pub const Schema = struct {
             /// is assumed to be part of the contract of the bitfield - attempts
             /// to encode or decode other values will produce validation errors.
             value: u16 = 0,
+
+            /// Validate that padding bits exactly match the provided value.
+            /// This is enabled by default.
+            exact: bool = true,
+
+            /// Set a custom error return value for mismatched padding bits.
+            /// For example, if a 3-bit pad should equal 000, but it is actually
+            /// 001, this error will be returned. By default, errors would
+            /// be `error.InvalidFieldValue`. Note that validation will only
+            /// happen when `exact` is true (which it is by default); if you
+            /// set it to false, then there will be no validation performed that
+            /// could produce this custom error.
+            err: anyerror = error.InvalidFieldValue,
         };
 
         /// Create an integer field. Useful for protocol header fields that include
@@ -143,10 +190,50 @@ pub const Schema = struct {
                 },
             });
 
+            const val: ?Validator = opts.validator orelse val_blk: {
+                // Minimum is set
+                if (opts.min) |min| {
+                    // And so is maximum
+                    if (opts.max) |max| {
+                        break :val_blk validators.Range.init(
+                            T,
+                            @as(T, min),
+                            @as(T, max),
+                            .{
+                                .min_err = opts.min_error,
+                                .max_err = opts.max_error,
+                            },
+                        );
+                    }
+
+                    // Only minimum is set
+                    break :val_blk validators.Min.init(T, @as(T, min), .{
+                        .err = opts.min_error,
+                    });
+                }
+
+                // Only maximum is set
+                if (opts.max) |max| {
+                    break :val_blk validators.Max.init(T, @as(T, max), .{
+                        .err = opts.max_error,
+                    });
+                }
+
+                // No validation is set
+                break :val_blk null;
+            };
+
+            if (val) |v| {
+                if (opts.default) |def| {
+                    v.validate(def) catch @compileError("default value is invalid for provided validation rule");
+                }
+            }
+
             return .{
                 .name = name,
                 .type = T,
                 .default = if (opts.default) |default| &default else null,
+                .validator = val,
             };
         }
 
@@ -168,6 +255,27 @@ pub const Schema = struct {
             /// for the field. However, it has no impact when either encoding
             /// or decoding bitfields.
             default: ?u16 = null,
+
+            /// Minimum value for the integer field. If non-null, any
+            /// encoding or decoding of the field will ensure that the actual
+            /// value is at least as great as the provided value.
+            min: ?comptime_int = null,
+
+            /// The error to return when `min` has been set and validation fails.
+            min_error: anyerror = error.ValueBelowMinimum,
+
+            /// Maximum value for the integer field. If non-null, any encoding
+            /// or decoding of the field will ensure that the actual value is
+            /// no greater than the provided value.
+            max: ?comptime_int = null,
+
+            /// The error to return when `max` has been set and validation fails.
+            max_error: anyerror = error.ValueAboveMaximum,
+
+            /// An optional validation rule for the field. If this is not null,
+            /// it will take precedence over any `min` or `max` provided in the
+            /// options.
+            validator: ?Validator = null,
         };
     };
 };
@@ -227,9 +335,11 @@ pub fn BitField(comptime schema: Schema) type {
         /// Produce a new bitfield from an underlying data structure. Validation
         /// failures will return errors, to avoid representing invalid states.
         pub fn fromData(data: Data) !Self {
-            return Self{
+            const self: Self = .{
                 .data = data,
             };
+            try self.validate();
+            return self;
         }
 
         /// Decode a numeric input into a bitfield. This does not include any
@@ -237,9 +347,11 @@ pub fn BitField(comptime schema: Schema) type {
         /// deserialization. Validation failures will return errors, to avoid
         /// representing invalid states.
         pub fn decode(input: T) !Self {
-            return .{
+            const self: Self = .{
                 .data = @bitCast(input),
             };
+            try self.validate();
+            return self;
         }
 
         /// Encode a bitfield into its numeric representation. This does not
@@ -247,7 +359,19 @@ pub fn BitField(comptime schema: Schema) type {
         /// be handled during serialization. Validation failures will return
         /// errors, to avoid representing invalid states.
         pub fn encode(self: Self) !T {
+            try self.validate();
             return @bitCast(self.data);
+        }
+
+        /// Validate the contents of the bitfield. For each sub-field that was
+        /// defined with a validator, execute that validator.
+        pub fn validate(self: Self) !void {
+            inline for (schema.fields) |field| {
+                if (field.validator) |field_validator| {
+                    const value = @field(self.data, field.name);
+                    try field_validator.validate(value);
+                }
+            }
         }
 
         /// Print a representation of the bitfield to the provided writer,
